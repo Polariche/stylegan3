@@ -14,6 +14,7 @@ import torch
 import torch.fft
 import torch.nn
 import matplotlib.cm
+import scipy
 import dnnlib
 from torch_utils.ops import upfirdn2d
 import legacy # pylint: disable=import-error
@@ -113,6 +114,34 @@ def _apply_affine_transformation(x, mat, up=4, **filter_kwargs):
     m[:, :, c:-c, c:-c] = 1
     m = torch.nn.functional.grid_sample(m, g, mode='nearest', padding_mode='zeros', align_corners=False)
     return z, m
+
+#----------------------------------------------------------------------------
+
+def _design_lowpass_filter(numtaps, cutoff, width, fs, scale, radial=False):
+    assert numtaps >= 1
+
+    # Identity filter.
+    if numtaps == 1:
+        return None
+
+    # Separable Kaiser low-pass filter.
+    #if not radial:
+        #f = scipy.signal.firwin(numtaps=numtaps, cutoff=cutoff, width=width * scale, fs=fs)
+        #return torch.as_tensor(f, dtype=torch.float32)
+
+    # Radially symmetric jinc-based filter.
+
+    x = (np.arange(numtaps) - (numtaps - 1) / 2) / (fs * scale)
+    r = np.hypot(*np.meshgrid(x, x))
+    f = scipy.special.j1(2 * cutoff * (np.pi * r) ) / (np.pi * r)
+
+    beta = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs * scale / 2)))
+    w = np.kaiser(numtaps, beta)
+
+    f *= np.outer(w, w)
+    f /= np.sum(f)
+
+    return torch.as_tensor(f, dtype=torch.float32)
 
 #----------------------------------------------------------------------------
 
@@ -259,6 +288,20 @@ class Renderer:
             except np.linalg.LinAlgError:
                 res.error = CapturedException()
             G.synthesis.input.transform.copy_(torch.from_numpy(m))
+
+        # Recover scale from input transform
+        scale = np.sqrt(m[0,0]**2 + m[0,1]**2)
+
+        # Modify upsampling & downsampling filter according to scale
+        for name in G.synthesis.layer_names[:-1]:
+            layer = getattr(G.synthesis, name)
+            
+            df = _design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
+            df = df.to(layer.down_filter.device)
+            uf = _design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
+            uf = uf.to(layer.up_filter.device)
+            layer.down_filter = df
+            layer.up_filter = uf
 
         # Generate random latents.
         all_seeds = [seed for seed, _weight in w0_seeds] + [stylemix_seed]
