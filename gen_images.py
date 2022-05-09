@@ -54,17 +54,72 @@ def parse_vec2(s: Union[str, Tuple[float, float]]) -> Tuple[float, float]:
 
 #----------------------------------------------------------------------------
 
-def make_transform(translate: Tuple[float,float], angle: float):
+
+def make_transform(translate: Tuple[float,float], angle: float, scale: float):
     m = np.eye(3)
     s = np.sin(angle/360.0*np.pi*2)
     c = np.cos(angle/360.0*np.pi*2)
-    m[0][0] = c
-    m[0][1] = s
+    m[0][0] = c * scale
+    m[0][1] = s  * scale
     m[0][2] = translate[0]
-    m[1][0] = -s
-    m[1][1] = c
+    m[1][0] = -s * scale
+    m[1][1] = c * scale
     m[1][2] = translate[1]
     return m
+
+import scipy
+def design_lowpass_filter(numtaps, cutoff, width, fs, scale, radial=False):
+    assert numtaps >= 1
+
+    # Identity filter.
+    if numtaps == 1:
+        return None
+
+    # Separable Kaiser low-pass filter.
+    #if not radial:
+        #f = scipy.signal.firwin(numtaps=numtaps, cutoff=cutoff, width=width * scale, fs=fs)
+        #return torch.as_tensor(f, dtype=torch.float32)
+
+    # Radially symmetric jinc-based filter.
+
+    x = (np.arange(numtaps) - (numtaps - 1) / 2) / (fs * scale)
+    r = np.hypot(*np.meshgrid(x, x))
+    f = scipy.special.j1(2 * cutoff * (np.pi * r) ) / (np.pi * r)
+
+    beta = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs * scale/ 2)))
+    w = np.kaiser(numtaps, beta)
+
+    f *= np.outer(w, w)
+    f /= np.sum(f)
+
+    return torch.as_tensor(f, dtype=torch.float32)
+
+def design_lowpass_filter_xscale_only(numtaps, cutoff, width, fs, scale, radial=False):
+    assert numtaps >= 1
+
+    # Identity filter.
+    if numtaps == 1:
+        return None
+
+    # Separable Kaiser low-pass filter.
+    if not radial:
+        f = scipy.signal.firwin(numtaps=numtaps, cutoff=cutoff, width=width, fs=fs)
+        return torch.as_tensor(f, dtype=torch.float32)
+
+    # Radially symmetric jinc-based filter.
+    x = (np.arange(numtaps) - (numtaps - 1) / 2) / fs
+    r = np.hypot(*np.meshgrid(x/scale, x))
+    f = scipy.special.j1(2 * cutoff * (np.pi * r) ) / (np.pi * r)
+
+    beta1 = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs / 2) * scale))
+    w1 = np.kaiser(numtaps, beta1)
+
+    beta2 = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs / 2)))
+    w2 = np.kaiser(numtaps, beta2)
+
+    f *= np.outer(w1, w2)
+    f /= np.sum(f)
+    return torch.as_tensor(f, dtype=torch.float32)
 
 #----------------------------------------------------------------------------
 
@@ -77,6 +132,7 @@ def make_transform(translate: Tuple[float,float], angle: float):
 @click.option('--translate', help='Translate XY-coordinate (e.g. \'0.3,1\')', type=parse_vec2, default='0,0', show_default=True, metavar='VEC2')
 @click.option('--rotate', help='Rotation angle in degrees', type=float, default=0, show_default=True, metavar='ANGLE')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
+@click.option('--scale', 'scale', help='Where to save the output images', type=float, default=1, metavar='SCALE')
 def generate_images(
     network_pkl: str,
     seeds: List[int],
@@ -85,6 +141,7 @@ def generate_images(
     outdir: str,
     translate: Tuple[float,float],
     rotate: float,
+    scale: float,
     class_idx: Optional[int]
 ):
     """Generate images using pretrained network pickle.
@@ -107,6 +164,47 @@ def generate_images(
     with dnnlib.util.open_url(network_pkl) as f:
         G = legacy.load_network_pkl(f)['G_ema'].to(device) # type: ignore
 
+    from training.networks_stylegan3 import SynthesisInput
+
+    s = 512
+    no_updown = False 
+
+    if no_updown:
+        input = SynthesisInput(
+                w_dim=G.synthesis.w_dim, channels=G.synthesis.input.channels, size=s,
+                sampling_rate=548, bandwidth=G.synthesis.input.bandwidth).to("cuda")
+        input.weight = G.synthesis.input.weight
+        input.affine = G.synthesis.input.affine
+        input.freqs = G.synthesis.input.freqs
+        input.phases = G.synthesis.input.phases
+    
+        G.synthesis.input = input
+
+
+    for i, name in enumerate(G.synthesis.layer_names[:-1]):
+        
+        layer = getattr(G.synthesis, name)
+
+        if not no_updown:
+            df = design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
+            df = df.to(layer.down_filter.device)
+            uf = design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
+            uf = uf.to(layer.up_filter.device)
+            layer.down_filter = df
+            layer.up_filter = uf
+
+        else:
+            layer.down_filter = None
+            layer.up_filter = None
+            layer.padding = [0,0,0,0]
+            layer.up_factor = 1
+            layer.down_factor = 1
+            layer.in_size[0] = s
+            layer.in_size[1] = s
+            layer.out_size[0] = s
+            layer.out_size[1] = s
+
+
     os.makedirs(outdir, exist_ok=True)
 
     # Labels.
@@ -128,7 +226,7 @@ def generate_images(
         # generator expects this matrix as an inverse to avoid potentially failing numerical
         # operations in the network.
         if hasattr(G.synthesis, 'input'):
-            m = make_transform(translate, rotate)
+            m = make_transform(translate, rotate, scale)
             m = np.linalg.inv(m)
             G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
