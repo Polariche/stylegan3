@@ -22,6 +22,8 @@ class EquivarianceWidget:
         self.rotate_def     = dnnlib.EasyDict(self.rotate)
         self.opts           = dnnlib.EasyDict(untransform=False)
         self.opts_def       = dnnlib.EasyDict(self.opts)
+        self.scale          = dnnlib.EasyDict(val=1, anim=False, speed=5e-3)
+        self.scale_def      = dnnlib.EasyDict(self.scale)
 
     @imgui_utils.scoped_by_object_id
     def __call__(self, show=True):
@@ -79,6 +81,30 @@ class EquivarianceWidget:
                 self.rotate = dnnlib.EasyDict(self.rotate_def)
 
         if show:
+            imgui.text('Scale')
+            imgui.same_line(viz.label_w)
+            with imgui_utils.item_width(viz.font_size * 8):
+                _changed, self.scale.val = imgui.input_float('##scale', self.scale.val, format='%.4f')
+            imgui.same_line(viz.label_w + viz.font_size * 8 + viz.spacing)
+            _clicked, dragging, dx, _dy = imgui_utils.drag_button('Drag fast##scale', width=viz.button_w)
+            if dragging:
+                self.scale.val += dx / viz.font_size * 2e-2
+            imgui.same_line()
+            _clicked, dragging, dx, _dy = imgui_utils.drag_button('Drag slow##scale', width=viz.button_w)
+            if dragging:
+                self.scale.val += dx / viz.font_size * 4e-4
+            imgui.same_line()
+            _clicked, self.scale.anim = imgui.checkbox('Anim##scale', self.scale.anim)
+            imgui.same_line()
+            with imgui_utils.item_width(-1 - viz.button_w - viz.spacing), imgui_utils.grayed_out(not self.scale.anim):
+                changed, speed = imgui.slider_float('##scale_speed', self.scale.speed, -1, 1, format='Speed %.4f', power=3)
+                if changed:
+                    self.scale.speed = speed
+            imgui.same_line()
+            if imgui_utils.button('Reset##scale', width=-1, enabled=(self.scale != self.scale_def)):
+                self.scale = dnnlib.EasyDict(self.scale_def)
+
+        if show:
             imgui.set_cursor_pos_x(imgui.get_content_region_max()[0] - 1 - viz.button_w*1 - viz.font_size*16)
             _clicked, self.opts.untransform = imgui.checkbox('Untransform', self.opts.untransform)
             imgui.same_line(imgui.get_content_region_max()[0] - 1 - viz.button_w)
@@ -104,10 +130,11 @@ class EquivarianceWidget:
         if self.xlate.round and 'img_resolution' in viz.result:
             pos = np.rint(pos * viz.result.img_resolution) / viz.result.img_resolution
         angle = self.rotate.val * np.pi * 2
+        scale = self.scale.val
 
         viz.args.input_transform = [
-            [np.cos(angle),  np.sin(angle), pos[0]],
-            [-np.sin(angle), np.cos(angle), pos[1]],
+            [np.cos(angle) * scale,  np.sin(angle) * scale, pos[0]],
+            [-np.sin(angle) * scale, np.cos(angle) * scale, pos[1]],
             [0, 0, 1]]
 
         viz.args.update(untransform=self.opts.untransform)
