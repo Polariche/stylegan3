@@ -228,7 +228,7 @@ def generate_images(
         if hasattr(G.synthesis, 'input'):
             m = make_transform(translate, rotate, scale)
             m = np.linalg.inv(m)
-            G.synthesis.input.transform.copy_(torch.from_numpy(m))
+            #G.synthesis.input.transform.copy_(torch.from_numpy(m))
 
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)

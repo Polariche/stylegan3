@@ -22,6 +22,7 @@ import torch
 from tqdm import tqdm
 
 import legacy
+import PIL.Image
 
 #----------------------------------------------------------------------------
 
@@ -84,8 +85,12 @@ def gen_interp_video(G, mp4: str, seeds, shuffle_seed=None, w_frames=60*4, kind=
             for xi in range(grid_w):
                 interp = grid[yi][xi]
                 w = torch.from_numpy(interp(frame_idx / w_frames)).to(device)
-                img = G.synthesis(ws=w.unsqueeze(0), noise_mode='const')[0]
-                imgs.append(img)
+                img = G.synthesis(ws=w.unsqueeze(0), noise_mode='const')
+
+                img_ = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+                PIL.Image.fromarray(img_[0].cpu().numpy(), 'RGB').save(f'video/{frame_idx}.png')
+
+                imgs.append(img[0])
         video_out.append_data(layout_grid(torch.stack(imgs), grid_w=grid_w, grid_h=grid_h))
     video_out.close()
 
