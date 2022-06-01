@@ -29,16 +29,11 @@ from pytorch3d.renderer import (
     look_at_view_transform,
     FoVPerspectiveCameras, 
     PointLights, 
-    DirectionalLights, 
     Materials, 
     RasterizationSettings, 
     MeshRenderer, 
     MeshRasterizer,  
     SoftPhongShader,
-    SoftSilhouetteShader,
-    SoftPhongShader,
-    TexturesVertex,
-    TexturesAtlas,
     TexturesUV
 )
 from pytorch3d.renderer.blending import (
@@ -261,6 +256,7 @@ class UVInput(torch.nn.Module):
         size,           # Output spatial size: int or [width, height].
         sampling_rate,  # Output sampling rate.
         bandwidth,      # Output bandwidth.
+        use_custom_transform = False,
     ):
         super().__init__()
         self.w_dim = w_dim
@@ -268,6 +264,7 @@ class UVInput(torch.nn.Module):
         self.size = np.broadcast_to(np.asarray(size), [2])
         self.sampling_rate = sampling_rate
         self.bandwidth = bandwidth
+        self.use_custom_transform = use_custom_transform
 
         # Draw random frequencies from uniform 2D disc.
         freqs = torch.randn([self.channels, 2])
@@ -279,7 +276,7 @@ class UVInput(torch.nn.Module):
         # Setup parameters and buffers.
         self.weight = torch.nn.Parameter(torch.randn([self.channels, self.channels]))
         self.affine = FullyConnectedLayer(w_dim, 3, weight_init=0, bias_init=[1,0,0])
-        self.register_buffer('transform', torch.eye(4, 4)) # User-specified inverse transform wrt. resulting image.
+        self.register_buffer('transform', torch.eye(4)) # User-specified inverse transform wrt. resulting image.
         self.register_buffer('freqs', freqs)
         self.register_buffer('phases', phases)
 
@@ -300,27 +297,7 @@ class UVInput(torch.nn.Module):
         self.register_buffer('uvfaces', uvfaces)
         self.register_buffer('faces', faces)
 
-
-    def forward(self, w):
-        device = w.device
-
-        # Introduce batch dimension.
-        transforms = self.transform.unsqueeze(0) # [batch, row, col]
-        freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
-        phases = self.phases.unsqueeze(0) # [batch, channel]
-
-        # Apply learned transformation.
-        #t = self.affine(w).float() # t = (dist, elev, azim)
-        t = torch.tensor([1,0,60], device=device, dtype=torch.float).unsqueeze(0).repeat(w.shape[0], 1)
-        
-        R, T = look_at_view_transform(dist=t[:,0], elev=t[:,1], azim=t[:,2])
-        R = R.to(device)
-        T = T.to(device)
-
-        # Transform frequencies.
-        T = T + (R @ transforms[:, :3, 3:]).squeeze(2)
-        R = R @ transforms[:, :3, :3]
-
+    def render_uv(self, R, T, device):
         cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
 
         grid = F.affine_grid(torch.eye(2,3, device=device).unsqueeze(0), (1, 2, self.size[1], self.size[0]))
@@ -351,8 +328,31 @@ class UVInput(torch.nn.Module):
             )
         )
 
-        target_images = renderer(mesh, cameras=cameras)[..., :2]
-        #target_images = grid
+        return renderer(mesh, cameras=cameras)[..., :2]
+
+
+    def forward(self, w):
+        device = w.device
+
+        # Introduce batch dimension.
+        transforms = self.transform.unsqueeze(0) # [batch, row, col]
+        freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
+        phases = self.phases.unsqueeze(0) # [batch, channel]
+
+        # Apply learned transformation.
+        #t = self.affine(w).float() # t = (dist, elev, azim)
+
+        if self.use_custom_transform:
+            R = transforms[:, :3, :3]
+            T = transforms[:, :3, 3]
+
+        else:
+            t = torch.tensor([1,0,0], device=device, dtype=torch.float).unsqueeze(0).repeat(w.shape[0], 1)
+            R, T = look_at_view_transform(dist=t[:,0], elev=t[:,1], azim=t[:,2])
+
+        R = R.to(device)
+        T = T.to(device)
+        target_images = self.render_uv(R, T, device)
 
         # Compute Fourier features.
         x = (target_images.unsqueeze(3) @ freqs.permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]

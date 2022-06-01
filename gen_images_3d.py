@@ -184,17 +184,17 @@ def generate_images(
     G.synthesis.input = input
 
     for i, name in enumerate(G.synthesis.layer_names[:-1]):
-        
+        scale = 0.7
         layer = getattr(G.synthesis, name)
-        """
-        if not no_updown:
-            df = design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
-            df = df.to(layer.down_filter.device)
-            uf = design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
-            uf = uf.to(layer.up_filter.device)
-            layer.down_filter = df
-            layer.up_filter = uf
         
+        df = design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
+        df = df.to(layer.down_filter.device)
+        uf = design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
+        uf = uf.to(layer.up_filter.device)
+        layer.down_filter = df
+        layer.up_filter = uf
+
+        """
         #else:
         layer.down_filter = None
         layer.up_filter = None
