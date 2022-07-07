@@ -20,6 +20,14 @@ import torch
 
 import legacy
 
+from training.networks_stylegan3 import UVInput, SynthesisInput
+    
+from pytorch3d.renderer import look_at_view_transform
+
+from torch_utils import misc
+import pickle
+import copy
+
 #----------------------------------------------------------------------------
 
 def parse_range(s: Union[str, List]) -> List[int]:
@@ -129,20 +137,33 @@ def design_lowpass_filter_xscale_only(numtaps, cutoff, width, fs, scale, radial=
 @click.option('--trunc', 'truncation_psi', type=float, help='Truncation psi', default=1, show_default=True)
 @click.option('--class', 'class_idx', type=int, help='Class label (unconditional if not specified)')
 @click.option('--noise-mode', help='Noise mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True)
-@click.option('--translate', help='Translate XY-coordinate (e.g. \'0.3,1\')', type=parse_vec2, default='0,0', show_default=True, metavar='VEC2')
-@click.option('--rotate', help='Rotation angle in degrees', type=float, default=0, show_default=True, metavar='ANGLE')
+#@click.option('--translate', help='Translate XY-coordinate (e.g. \'0.3,1\')', type=parse_vec2, default='0,0', show_default=True, metavar='VEC2')
+#@click.option('--rotate', help='Rotation angle in degrees', type=float, default=0, show_default=True, metavar='ANGLE')
 @click.option('--outdir', help='Where to save the output images', type=str, required=True, metavar='DIR')
-@click.option('--scale', 'scale', help='Where to save the output images', type=float, default=1, metavar='SCALE')
+
+@click.option('--scale', 'scale', help='Filter scale', type=float, default=1, metavar='SCALE')
+@click.option('--dist', 'dist', help='Camera distance', type=float, default=1, metavar='DISTANCE')
+@click.option('--elev', 'elev', help='Camera elevation', type=float, default=0, metavar='ELEVATION')
+@click.option('--azim', 'azim', help='Camera aziumth', type=float, default=0, metavar='AZIMUTH')
+
+@click.option('--save-network', 'save_network', help='Should we save the modified network?', type=bool, default=False, metavar='SAVE_NETWORK')
+@click.option('--mode', help='Generation Mode', type=click.Choice(["standard", "no_updown_no_filter", "no_updown_filtered"]), default='standard', show_default=True)
+
 def generate_images(
     network_pkl: str,
     seeds: List[int],
     truncation_psi: float,
     noise_mode: str,
     outdir: str,
-    translate: Tuple[float,float],
-    rotate: float,
+    #translate: Tuple[float,float],
+    #rotate: float,
     scale: float,
-    class_idx: Optional[int]
+    dist: float,
+    elev: float,
+    azim: float,
+    class_idx: Optional[int],
+    save_network: bool,
+    mode: str
 ):
     """Generate images using pretrained network pickle.
 
@@ -162,53 +183,65 @@ def generate_images(
     print('Loading networks from "%s"...' % network_pkl)
     device = torch.device('cuda')
     with dnnlib.util.open_url(network_pkl) as f:
-        G = legacy.load_network_pkl(f)['G_ema'].to(device) # type: ignore
+        pkl = legacy.load_network_pkl(f)
+        G = pkl['G_ema'].to(device) # type: ignore
+    os.makedirs(outdir, exist_ok=True)
 
-    from training.networks_stylegan3 import UVInput, SynthesisInput
+    s = getattr(G.synthesis, G.synthesis.layer_names[-1]).out_size[1]
 
-    s = 256
-    
-    input = UVInput(
-            w_dim=G.synthesis.w_dim, channels=G.synthesis.input.channels, size=G.synthesis.input.size,
-            sampling_rate=G.synthesis.input.sampling_rate, bandwidth=G.synthesis.input.bandwidth).to("cuda")
-    """
-    input = UVInput(
+    if mode != "standard":
+        input = UVInput(
             w_dim=G.synthesis.w_dim, channels=G.synthesis.input.channels, size=s,
-            sampling_rate=s+20, bandwidth=G.synthesis.input.bandwidth).to("cuda")
-    """
-    input.affine = G.synthesis.input.affine
+            sampling_rate=s+20, bandwidth=G.synthesis.input.bandwidth,
+            use_custom_transform=True).to("cuda")
+    else:
+        input = UVInput(
+                w_dim=G.synthesis.w_dim, channels=G.synthesis.input.channels, size=G.synthesis.input.size,
+                sampling_rate=G.synthesis.input.sampling_rate, bandwidth=G.synthesis.input.bandwidth,
+                use_custom_transform=True).to("cuda")
+
+    #input.affine = G.synthesis.input.affine
     input.weight = G.synthesis.input.weight
     input.freqs = G.synthesis.input.freqs
     input.phases = G.synthesis.input.phases
 
+    R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim)
+    input_transform = torch.eye(4)
+    input_transform[:3, :3] = R[0]
+    input_transform[:3, 3] = T[0]
+    input.transform = input_transform
+
     G.synthesis.input = input
 
     for i, name in enumerate(G.synthesis.layer_names[:-1]):
-        scale = 0.7
         layer = getattr(G.synthesis, name)
+
+        if mode == "no_updown_filtered":
+            layer.down_filter = design_lowpass_filter(numtaps=2*6, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=s*2, scale=scale, radial=layer.down_radial).to(layer.down_filter.device)
+            layer.up_filter = design_lowpass_filter(numtaps=2*6, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=s*2).to(layer.up_filter.device)
+            layer.padding = [11,10,11,10]
+            layer.up_factor = 2
+            layer.down_factor = 2
+            layer.in_size = [s,s]
+            layer.out_size = [s,s]
+
+        elif mode == "no_updown_no_filter":
+            layer.down_filter = None 
+            layer.up_filter = None
+            layer.padding = [0,0,0,0]
+            layer.up_factor = 1
+            layer.down_factor = 1
+            layer.in_size = [s,s]
+            layer.out_size = [s,s]
+
+        elif mode == "standard":
+            df = design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
+            df = df.to(layer.down_filter.device)
+            uf = design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
+            uf = uf.to(layer.up_filter.device)
+            layer.down_filter = df
+            layer.up_filter = uf
         
-        df = design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
-        df = df.to(layer.down_filter.device)
-        uf = design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
-        uf = uf.to(layer.up_filter.device)
-        layer.down_filter = df
-        layer.up_filter = uf
-
-        """
-        #else:
-        layer.down_filter = None
-        layer.up_filter = None
-        layer.padding = [0,0,0,0]
-        layer.up_factor = 1
-        layer.down_factor = 1
-        layer.in_size[0] = s
-        layer.in_size[1] = s
-        layer.out_size[0] = s
-        layer.out_size[1] = s
-        """
-
-    os.makedirs(outdir, exist_ok=True)
-
     # Labels.
     label = torch.zeros([1, G.c_dim], device=device)
     if G.c_dim != 0:
@@ -224,19 +257,37 @@ def generate_images(
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
 
-        # Construct an inverse rotation/translation matrix and pass to the generator.  The
-        # generator expects this matrix as an inverse to avoid potentially failing numerical
-        # operations in the network.
-        if hasattr(G.synthesis, 'input'):
-            m = make_transform(translate, rotate, scale)
-            m = np.linalg.inv(m)
-            #G.synthesis.input.transform.copy_(torch.from_numpy(m))
-
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
-        #img = G.synthesis.input.forward_render_only(z)
         img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
         PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
 
+    uv_affine = G.synthesis.input.uv_affine
+    uv = G.synthesis.input.saved_uv
+
+    uv = (uv - uv_affine[:, 2].unsqueeze(0).unsqueeze(1).unsqueeze(2)).unsqueeze(3)
+    uv = uv @ torch.linalg.inv(uv_affine[:, :2]).unsqueeze(0).unsqueeze(1).unsqueeze(2)
+    uv = uv.squeeze(3)
+    uv = (uv * 255).clamp(0, 255).to(torch.uint8)
+    uv = torch.cat([uv, torch.ones_like(uv)[..., :1]], dim=-1)
+    PIL.Image.fromarray(uv[0].cpu().numpy(), 'RGB').save(f'{outdir}/uv.png')
+
+    if save_network:
+        # Save network snapshot.
+        snapshot_pkl = None
+        snapshot_data = dict(G=G, D=pkl['D'], G_ema=G)
+        for key, value in snapshot_data.items():
+            if isinstance(value, torch.nn.Module):
+                value = copy.deepcopy(value).eval().requires_grad_(False)
+                if True:
+                    misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
+                    for param in misc.params_and_buffers(value):
+                        torch.distributed.broadcast(param, src=0)
+                snapshot_data[key] = value.cpu()
+            del value # conserve memory
+        snapshot_pkl = os.path.join(outdir, f'network-snapshot.pkl')
+        if True:
+            with open(snapshot_pkl, 'wb') as f:
+                pickle.dump(snapshot_data, f)
 
 #----------------------------------------------------------------------------
 
