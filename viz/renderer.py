@@ -279,6 +279,20 @@ class Renderer:
         res.has_noise = any('noise_const' in name for name, _buf in G.synthesis.named_buffers())
         res.has_input_transform = (hasattr(G.synthesis, 'input') and hasattr(G.synthesis.input, 'transform'))
 
+        s = getattr(G.synthesis, G.synthesis.layer_names[-1]).out_size[1]
+        no_updown = False
+
+        if no_updown:
+            input = G.synthesis.input.__class__(
+                    w_dim=G.synthesis.w_dim, channels=G.synthesis.input.channels, size=s,
+                    sampling_rate=s+20, bandwidth=G.synthesis.input.bandwidth).to("cuda")
+            input.weight = G.synthesis.input.weight
+            input.affine = G.synthesis.input.affine
+            input.freqs = G.synthesis.input.freqs
+            input.phases = G.synthesis.input.phases
+        
+            G.synthesis.input = input
+
         # Set input transform.
         if res.has_input_transform:
             m = np.eye(3)
@@ -288,20 +302,30 @@ class Renderer:
             except np.linalg.LinAlgError:
                 res.error = CapturedException()
             G.synthesis.input.transform.copy_(torch.from_numpy(m))
-
-        # Recover scale from input transform
-        scale = np.sqrt(m[0,0]**2 + m[0,1]**2)
+        scale = 1 / np.sqrt(m[0,0]**2 + m[0,1]**2)
 
         # Modify upsampling & downsampling filter according to scale
         for name in G.synthesis.layer_names[:-1]:
             layer = getattr(G.synthesis, name)
             
-            df = _design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
-            df = df.to(layer.down_filter.device)
-            uf = _design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
-            uf = uf.to(layer.up_filter.device)
-            layer.down_filter = df
-            layer.up_filter = uf
+            if not no_updown:
+                df = _design_lowpass_filter(numtaps=layer.down_taps, cutoff=layer.out_cutoff,  width=layer.out_half_width*2, fs=layer.tmp_sampling_rate, scale=scale, radial=layer.down_radial)
+                df = df.to(layer.down_filter.device)
+                uf = _design_lowpass_filter(numtaps=layer.up_taps, cutoff=layer.in_cutoff, width=layer.in_half_width*2, scale=scale, fs=layer.tmp_sampling_rate)
+                uf = uf.to(layer.up_filter.device)
+                layer.down_filter = df
+                layer.up_filter = uf
+
+            else:
+                layer.down_filter = None
+                layer.up_filter = None
+                layer.padding = [0,0,0,0]
+                layer.up_factor = 1
+                layer.down_factor = 1
+                layer.in_size[0] = s
+                layer.in_size[1] = s
+                layer.out_size[0] = s
+                layer.out_size[1] = s
 
         # Generate random latents.
         all_seeds = [seed for seed, _weight in w0_seeds] + [stylemix_seed]
