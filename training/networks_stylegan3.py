@@ -209,15 +209,9 @@ class HardAlbedoShader(nn.Module):
         self,
         device: "cpu",
         cameras: Optional[TensorProperties] = None,
-        lights: Optional[TensorProperties] = None,
-        materials: Optional[Materials] = None,
         blend_params: Optional[BlendParams] = None,
     ) -> None:
         super().__init__()
-        self.lights = lights if lights is not None else PointLights(device=device)
-        self.materials = (
-            materials if materials is not None else Materials(device=device)
-        )
         self.cameras = cameras
         self.blend_params = blend_params if blend_params is not None else BlendParams()
 
@@ -227,8 +221,6 @@ class HardAlbedoShader(nn.Module):
         cameras = self.cameras
         if cameras is not None:
             self.cameras = cameras.to(device)
-        self.materials = self.materials.to(device)
-        self.lights = self.lights.to(device)
         return self
 
 
@@ -240,8 +232,6 @@ class HardAlbedoShader(nn.Module):
             raise ValueError(msg)
 
         texels = meshes.sample_textures(fragments)
-        lights = kwargs.get("lights", self.lights)
-        materials = kwargs.get("materials", self.materials)
         blend_params = kwargs.get("blend_params", self.blend_params)
         colors = texels
         images = hard_rgb_blend(colors, fragments, blend_params)
@@ -276,9 +266,26 @@ class UVInput(torch.nn.Module):
         # Setup parameters and buffers.
         self.weight = torch.nn.Parameter(torch.randn([self.channels, self.channels]))
         self.affine = FullyConnectedLayer(w_dim, 3, weight_init=0, bias_init=[1,0,0])
-        self.register_buffer('transform', torch.eye(4)) # User-specified inverse transform wrt. resulting image.
+
+        # camera transform
+        R, T = look_at_view_transform(dist=1, elev=0, azim=0)
+        input_transform = torch.eye(4)
+        input_transform[:3, :3] = R[0]
+        input_transform[:3, 3] = T[0]
+
+        # align uv map to the center of the face image
+        uv_affine = torch.eye(2,3)
+        
+        uv_affine[0,0] = 1 / 2.5   # scaling
+        uv_affine[1,1] = 1 / 1.7
+
+        uv_affine[0,2] = 0.4       # translation
+        uv_affine[1,2] = -0.05
+
+        self.register_buffer('transform', input_transform)
         self.register_buffer('freqs', freqs)
         self.register_buffer('phases', phases)
+        self.register_buffer('uv_affine', uv_affine)
 
         self.set_obj("./data/head_template_mesh.obj")
     
@@ -300,9 +307,9 @@ class UVInput(torch.nn.Module):
     def render_uv(self, R, T, device):
         cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
 
-        grid = F.affine_grid(torch.eye(2,3, device=device).unsqueeze(0), (1, 2, self.size[1], self.size[0]))
-        #grid[..., 0] = 0.5 * self.size[0] / self.sampling_rate
-        #grid[..., 1] = 0.5 * self.size[1] / self.sampling_rate
+        uv_affine = self.uv_affine.unsqueeze(0).to(device)
+
+        grid = F.affine_grid(uv_affine, (1, 2, self.size[1], self.size[0]))
         tex = TexturesUV(grid, self.uvfaces.to(device), self.uvcoords.to(device))
 
         mesh = Meshes(
@@ -328,31 +335,39 @@ class UVInput(torch.nn.Module):
             )
         )
 
-        return renderer(mesh, cameras=cameras)[..., :2]
+        render = renderer(mesh, cameras=cameras)[..., :2]
+        misc.assert_shape(render, [R.shape[0], int(self.size[1]), int(self.size[0]), 2])
+        return render
 
 
     def forward(self, w):
         device = w.device
 
         # Introduce batch dimension.
-        transforms = self.transform.unsqueeze(0) # [batch, row, col]
-        freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
-        phases = self.phases.unsqueeze(0) # [batch, channel]
+        transforms = self.transform 
+        if len(transforms.shape) < 3:
+            transforms = transforms.unsqueeze(0)   # [batch, row, col]
+        else:
+            misc.assert_shape(transforms, [w.shape[0], 4, 4])
 
-        # Apply learned transformation.
-        #t = self.affine(w).float() # t = (dist, elev, azim)
+        freqs = self.freqs.unsqueeze(0)            # [batch, channel, xy]
+        phases = self.phases.unsqueeze(0)          # [batch, channel]
 
         if self.use_custom_transform:
             R = transforms[:, :3, :3]
             T = transforms[:, :3, 3]
 
         else:
-            t = torch.tensor([1,0,0], device=device, dtype=torch.float).unsqueeze(0).repeat(w.shape[0], 1)
+            # Apply learned transformation.
+            t = self.affine(w).float() # t = (dist, elev, azim)
+            #t = torch.tensor([1,0,0], device=device, dtype=torch.float).unsqueeze(0).repeat(w.shape[0], 1)
             R, T = look_at_view_transform(dist=t[:,0], elev=t[:,1], azim=t[:,2])
 
         R = R.to(device)
         T = T.to(device)
         target_images = self.render_uv(R, T, device)
+
+        self.register_buffer('saved_uv', target_images)
 
         # Compute Fourier features.
         x = (target_images.unsqueeze(3) @ freqs.permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]
@@ -711,6 +726,126 @@ class Generator(torch.nn.Module):
         self.img_resolution = img_resolution
         self.img_channels = img_channels
         self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.num_ws = self.synthesis.num_ws
+        self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+
+    def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+        ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
+        img = self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
+        return img
+
+#----------------------------------------------------------------------------
+
+
+@persistence.persistent_class
+class SynthesisNetwork3D(torch.nn.Module):
+    def __init__(self,
+        w_dim,                          # Intermediate latent (W) dimensionality.
+        img_resolution,                 # Output image resolution.
+        img_channels,                   # Number of color channels.
+        channel_base        = 32768,    # Overall multiplier for the number of channels.
+        channel_max         = 512,      # Maximum number of channels in any layer.
+        num_layers          = 14,       # Total number of layers, excluding Fourier features and ToRGB.
+        num_critical        = 2,        # Number of critically sampled layers at the end.
+        first_cutoff        = 2,        # Cutoff frequency of the first layer (f_{c,0}).
+        first_stopband      = 2**2.1,   # Minimum stopband of the first layer (f_{t,0}).
+        last_stopband_rel   = 2**0.3,   # Minimum stopband of the last layer, expressed relative to the cutoff.
+        margin_size         = 10,       # Number of additional pixels outside the image.
+        output_scale        = 0.25,     # Scale factor for the output image.
+        num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
+        **layer_kwargs,                 # Arguments for SynthesisLayer.
+    ):
+        super().__init__()
+        self.w_dim = w_dim
+        self.num_ws = num_layers + 2
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.num_layers = num_layers
+        self.num_critical = num_critical
+        self.margin_size = margin_size
+        self.output_scale = output_scale
+        self.num_fp16_res = num_fp16_res
+
+        # Geometric progression of layer cutoffs and min. stopbands.
+        last_cutoff = self.img_resolution / 2 # f_{c,N}
+        last_stopband = last_cutoff * last_stopband_rel # f_{t,N}
+        exponents = np.minimum(np.arange(self.num_layers + 1) / (self.num_layers - self.num_critical), 1)
+        cutoffs = first_cutoff * (last_cutoff / first_cutoff) ** exponents # f_c[i]
+        stopbands = first_stopband * (last_stopband / first_stopband) ** exponents # f_t[i]
+
+        # Compute remaining layer parameters.
+        sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, self.img_resolution)))) # s[i]
+        half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
+        sizes = sampling_rates + self.margin_size * 2
+        sizes[-2:] = self.img_resolution
+        channels = np.rint(np.minimum((channel_base / 2) / cutoffs, channel_max))
+        channels[-1] = self.img_channels
+
+        # Construct layers.
+        self.input = UVInput(
+            w_dim=self.w_dim, channels=int(channels[0]), size=int(sizes[0]),
+            sampling_rate=sampling_rates[0], bandwidth=cutoffs[0])
+        self.layer_names = []
+        for idx in range(self.num_layers + 1):
+            prev = max(idx - 1, 0)
+            is_torgb = (idx == self.num_layers)
+            is_critically_sampled = (idx >= self.num_layers - self.num_critical)
+            use_fp16 = (sampling_rates[idx] * (2 ** self.num_fp16_res) > self.img_resolution)
+            layer = SynthesisLayer(
+                w_dim=self.w_dim, is_torgb=is_torgb, is_critically_sampled=is_critically_sampled, use_fp16=use_fp16,
+                in_channels=int(channels[prev]), out_channels= int(channels[idx]),
+                in_size=int(sizes[prev]), out_size=int(sizes[idx]),
+                in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]),
+                in_cutoff=cutoffs[prev], out_cutoff=cutoffs[idx],
+                in_half_width=half_widths[prev], out_half_width=half_widths[idx],
+                **layer_kwargs)
+            name = f'L{idx}_{layer.out_size[0]}_{layer.out_channels}'
+            setattr(self, name, layer)
+            self.layer_names.append(name)
+
+    def forward(self, ws, **layer_kwargs):
+        misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
+        ws = ws.to(torch.float32).unbind(dim=1)
+
+        # Execute layers.
+        x = self.input(ws[0])
+        for name, w in zip(self.layer_names, ws[1:]):
+            x = getattr(self, name)(x, w, **layer_kwargs)
+        if self.output_scale != 1:
+            x = x * self.output_scale
+
+        # Ensure correct shape and dtype.
+        misc.assert_shape(x, [None, self.img_channels, self.img_resolution, self.img_resolution])
+        x = x.to(torch.float32)
+        return x
+
+    def extra_repr(self):
+        return '\n'.join([
+            f'w_dim={self.w_dim:d}, num_ws={self.num_ws:d},',
+            f'img_resolution={self.img_resolution:d}, img_channels={self.img_channels:d},',
+            f'num_layers={self.num_layers:d}, num_critical={self.num_critical:d},',
+            f'margin_size={self.margin_size:d}, num_fp16_res={self.num_fp16_res:d}'])
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class Generator3D(torch.nn.Module):
+    def __init__(self,
+        z_dim,                      # Input latent (Z) dimensionality.
+        c_dim,                      # Conditioning label (C) dimensionality.
+        w_dim,                      # Intermediate latent (W) dimensionality.
+        img_resolution,             # Output resolution.
+        img_channels,               # Number of output color channels.
+        mapping_kwargs      = {},   # Arguments for MappingNetwork.
+        **synthesis_kwargs,         # Arguments for SynthesisNetwork.
+    ):
+        super().__init__()
+        self.z_dim = z_dim
+        self.c_dim = c_dim
+        self.w_dim = w_dim
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.synthesis = SynthesisNetwork3D(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
